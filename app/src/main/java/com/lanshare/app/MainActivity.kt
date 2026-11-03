@@ -21,8 +21,10 @@ import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
@@ -36,6 +38,7 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.nio.ByteBuffer
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
@@ -44,6 +47,8 @@ import kotlin.concurrent.thread
 
 data class Peer(val id: String, val name: String, val ip: String, val port: Int, val seen: Long)
 
+data class FileInfo(val name: String, val size: Long)
+
 class MainActivity : AppCompatActivity() {
 
     companion object {
@@ -51,6 +56,7 @@ class MainActivity : AppCompatActivity() {
         const val TCP_PORT = 50506
         const val MAGIC = "LANSHARE1"
         const val CHUNK = 256 * 1024
+        const val MAX_HEADER = 4 * 1024 * 1024 // لیست تعداد زیادی فایل هم جا شود
     }
 
     private val myId = UUID.randomUUID().toString().take(8)
@@ -75,6 +81,11 @@ class MainActivity : AppCompatActivity() {
     private var selectedId: String? = null
 
     private val picker = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+        if (uris.isNotEmpty()) sendFiles(uris)
+    }
+
+    // انتخاب از گالری (عکس و ویدیو) - بدون نیاز به مجوز
+    private val galleryPicker = registerForActivityResult(ActivityResultContracts.PickMultipleVisualMedia()) { uris ->
         if (uris.isNotEmpty()) sendFiles(uris)
     }
 
@@ -114,11 +125,18 @@ class MainActivity : AppCompatActivity() {
         ipInput = EditText(this).apply { hint = "یا IP دستی (مثلاً 192.168.1.20)" }
         root.addView(ipInput)
 
+        val btnRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         val sendBtn = Button(this).apply {
             text = "ارسال فایل..."
             setOnClickListener { pickFiles() }
         }
-        root.addView(sendBtn)
+        val galleryBtn = Button(this).apply {
+            text = "گالری"
+            setOnClickListener { pickGallery() }
+        }
+        btnRow.addView(sendBtn, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        btnRow.addView(galleryBtn, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        root.addView(btnRow)
 
         progress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply { max = 100 }
         root.addView(progress)
@@ -254,20 +272,42 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun askAccept(from: String, name: String, size: Long): Boolean {
+    /** لیست فایل‌ها را با چک‌باکس نشان می‌دهد و ایندکس فایل‌های تیک‌خورده را برمی‌گرداند. */
+    private fun askAccept(from: String, files: List<FileInfo>): List<Int> {
         val latch = CountDownLatch(1)
-        var ok = false
+        var result: List<Int> = emptyList()
+        var dialog: AlertDialog? = null
+        val checked = BooleanArray(files.size) { true }
+        val labels = files.map { "${it.name}  (${fmt(it.size)})" }.toTypedArray()
+        val total = files.sumOf { it.size }
+
         runOnUiThread {
-            AlertDialog.Builder(this)
-                .setTitle("فایل ورودی")
-                .setMessage("$from می‌خواهد «$name» (${fmt(size)}) را بفرستد.\nقبول می‌کنید؟")
-                .setPositiveButton("قبول") { _, _ -> ok = true; latch.countDown() }
-                .setNegativeButton("رد") { _, _ -> latch.countDown() }
+            val dlg = AlertDialog.Builder(this)
+                .setTitle("$from — ${files.size} فایل (${fmt(total)})")
+                .setMultiChoiceItems(labels, checked) { _, which, isChecked -> checked[which] = isChecked }
+                .setPositiveButton("دریافت انتخاب‌شده‌ها") { _, _ ->
+                    result = checked.indices.filter { checked[it] }
+                    latch.countDown()
+                }
+                .setNegativeButton("رد همه") { _, _ -> latch.countDown() }
+                .setNeutralButton("همه / هیچ", null)
                 .setOnCancelListener { latch.countDown() }
-                .show()
+                .create()
+            dialog = dlg
+            dlg.show()
+            // دکمه «همه / هیچ» نباید دیالوگ را ببندد
+            dlg.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener {
+                val newState = checked.any { !it }
+                for (i in checked.indices) {
+                    checked[i] = newState
+                    dlg.listView.setItemChecked(i, newState)
+                }
+            }
         }
-        latch.await(100, TimeUnit.SECONDS)
-        return ok
+        if (!latch.await(100, TimeUnit.SECONDS)) {
+            runOnUiThread { try { dialog?.dismiss() } catch (_: Exception) {} }
+        }
+        return result
     }
 
     private fun handleIncoming(s: Socket) {
@@ -277,76 +317,113 @@ class MainActivity : AppCompatActivity() {
             s.soTimeout = 30000
 
             val len = inp.readInt()
-            if (len !in 1..65536) return
+            if (len !in 1..MAX_HEADER) return
             val hb = ByteArray(len)
             inp.readFully(hb)
             val j = JSONObject(String(hb, Charsets.UTF_8))
-            val name = File(j.getString("name")).name.replace(Regex("[\\\\/:*?\"<>|]"), "_").ifBlank { "file" }
-            val size = j.getLong("size")
             val from = j.optString("from", "?")
+            val arr = j.getJSONArray("files")
+            if (arr.length() == 0) return
+            val files = (0 until arr.length()).map { i ->
+                val o = arr.getJSONObject(i)
+                val size = o.getLong("size")
+                if (size < 0) throw IOException("اندازه فایل نامعتبر است")
+                val name = File(o.getString("name")).name
+                    .replace(Regex("[\\/:*?\"<>|]"), "_").ifBlank { "file" }
+                FileInfo(name, size)
+            }
 
-            if (!askAccept(from, name, size)) {
-                out.write(0); out.flush()
-                log("✗ فایل «$name» از $from رد شد")
+            // کاربر در یک لیست تیک‌دار انتخاب می‌کند
+            val accepted = askAccept(from, files)
+            val reply = JSONObject().put("accept", JSONArray(accepted)).toString().toByteArray(Charsets.UTF_8)
+            out.write(ByteBuffer.allocate(4 + reply.size).putInt(reply.size).put(reply).array())
+            out.flush()
+
+            if (accepted.isEmpty()) {
+                log("✗ ${files.size} فایل از $from رد شد")
                 return
             }
-            out.write(1); out.flush()
+            if (accepted.size < files.size) log("${files.size - accepted.size} فایل توسط شما حذف شد")
 
-            val values = ContentValues().apply {
-                put(MediaStore.Downloads.DISPLAY_NAME, name)
-                put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/LanShare")
-                put(MediaStore.Downloads.IS_PENDING, 1)
-            }
-            val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-                ?: throw IOException("امکان ساخت فایل نبود")
-            try {
-                contentResolver.openOutputStream(uri)!!.use { os ->
-                    val buf = ByteArray(CHUNK)
-                    var got = 0L
-                    while (got < size) {
-                        val n = inp.read(buf, 0, minOf(buf.size.toLong(), size - got).toInt())
-                        if (n < 0) throw IOException("اتصال قطع شد")
-                        os.write(buf, 0, n)
-                        got += n
-                        setProgress(got, size)
-                    }
+            val totalBytes = accepted.sumOf { files[it].size }
+            var doneBytes = 0L
+            var count = 0
+
+            for (idx in accepted) {
+                val f = files[idx]
+                count++
+                log("($count/${accepted.size}) در حال دریافت «${f.name}» ...")
+
+                val values = ContentValues().apply {
+                    put(MediaStore.Downloads.DISPLAY_NAME, f.name)
+                    put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/LanShare")
+                    put(MediaStore.Downloads.IS_PENDING, 1)
                 }
-                val done = ContentValues().apply { put(MediaStore.Downloads.IS_PENDING, 0) }
-                contentResolver.update(uri, done, null, null)
-            } catch (e: Exception) {
-                contentResolver.delete(uri, null, null)
-                throw e
+                val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                    ?: throw IOException("امکان ساخت فایل نبود")
+                try {
+                    contentResolver.openOutputStream(uri)!!.use { os ->
+                        val buf = ByteArray(CHUNK)
+                        var got = 0L
+                        while (got < f.size) {
+                            val n = inp.read(buf, 0, minOf(buf.size.toLong(), f.size - got).toInt())
+                            if (n < 0) throw IOException("اتصال قطع شد")
+                            os.write(buf, 0, n)
+                            got += n
+                            doneBytes += n
+                            setProgress(doneBytes, totalBytes)
+                        }
+                    }
+                    val done = ContentValues().apply { put(MediaStore.Downloads.IS_PENDING, 0) }
+                    contentResolver.update(uri, done, null, null)
+                } catch (e: Exception) {
+                    contentResolver.delete(uri, null, null)
+                    throw e
+                }
+                log("✓ «${f.name}» دریافت شد ← Downloads/LanShare")
             }
             out.write(1); out.flush()
-            log("✓ «$name» از $from دریافت شد ← Downloads/LanShare")
+            log("✓ همه فایل‌های انتخابی از $from دریافت شد (${accepted.size} فایل)")
         }
     }
 
     // ---------------- ارسال ----------------
-    private fun pickFiles() {
-        picker.launch(arrayOf("*/*"))
-    }
-
-    private fun sendFiles(uris: List<Uri>) {
+    private fun resolveTarget(): Pair<String, Int>? {
         val manual = ipInput.text.toString().trim()
         val target: Pair<String, Int>? = if (manual.isNotEmpty()) {
             Pair(manual, TCP_PORT)
         } else {
-            peers[selectedId]?.let { Pair(it.ip, it.port) }
+            selectedId?.let { id -> peers[id]?.let { Pair(it.ip, it.port) } }
         }
         if (target == null) {
             Toast.makeText(this, "ابتدا یک دستگاه انتخاب کنید یا IP را وارد کنید", Toast.LENGTH_LONG).show()
-            return
         }
+        return target
+    }
+
+    private fun pickFiles() {
+        if (resolveTarget() == null) return
+        picker.launch(arrayOf("*/*"))
+    }
+
+    private fun pickGallery() {
+        if (resolveTarget() == null) return
+        galleryPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo))
+    }
+
+    private fun sendFiles(uris: List<Uri>) {
+        val target = resolveTarget() ?: return
         thread(isDaemon = true) {
-            for (u in uris) {
-                try { sendOne(target.first, target.second, u) }
-                catch (e: Exception) { log("✗ ارسال ناموفق: ${e.message}"); setProgress(0, 1) }
+            try {
+                sendBatch(target.first, target.second, uris)
+            } catch (e: Exception) {
+                log("✗ ارسال ناموفق: ${e.message}")
+                setProgress(0, 1)
             }
         }
     }
 
-    private fun sendOne(ip: String, port: Int, uri: Uri) {
+    private fun queryInfo(uri: Uri): FileInfo {
         var name = "file"
         var size = -1L
         contentResolver.query(uri, null, null, null, null)?.use { c ->
@@ -360,38 +437,75 @@ class MainActivity : AppCompatActivity() {
         if (size < 0) {
             contentResolver.openAssetFileDescriptor(uri, "r")?.use { size = it.length }
         }
-        if (size < 0) throw IOException("اندازه فایل نامشخص است")
+        if (size < 0) throw IOException("اندازه فایل «$name» نامشخص است")
+        return FileInfo(name, size)
+    }
 
-        log("در حال اتصال برای ارسال «$name» ...")
+    /** همه فایل‌ها در یک اتصال: اول لیست، بعد فقط فایل‌هایی که گیرنده تیک زده. */
+    private fun sendBatch(ip: String, port: Int, uris: List<Uri>) {
+        val sendUris = ArrayList<Uri>()
+        val infos = ArrayList<FileInfo>()
+        for (u in uris) {
+            try {
+                infos.add(queryInfo(u)); sendUris.add(u)
+            } catch (e: Exception) {
+                log("✗ نادیده گرفته شد: ${e.message}")
+            }
+        }
+        if (infos.isEmpty()) throw IOException("فایل قابل ارسالی نبود")
+
+        log("در حال اتصال برای ارسال ${infos.size} فایل ...")
         Socket().use { s ->
             s.connect(InetSocketAddress(ip, port), 10000)
             val out = DataOutputStream(BufferedOutputStream(s.getOutputStream(), CHUNK))
             val inp = DataInputStream(s.getInputStream())
-            val hdr = JSONObject().put("name", name).put("size", size).put("from", myName)
+
+            val arr = JSONArray()
+            infos.forEach { arr.put(JSONObject().put("name", it.name).put("size", it.size)) }
+            val hdr = JSONObject().put("from", myName).put("files", arr)
                 .toString().toByteArray(Charsets.UTF_8)
             out.writeInt(hdr.size)
             out.write(hdr)
             out.flush()
 
-            s.soTimeout = 120000 // منتظر تایید کاربر مقصد
-            if (inp.readByte().toInt() != 1) throw IOException("دستگاه مقصد فایل را رد کرد")
+            log("منتظر انتخاب کاربر مقصد ...")
+            s.soTimeout = 120000 // منتظر انتخاب کاربر مقصد
+            val rl = inp.readInt()
+            if (rl !in 1..MAX_HEADER) throw IOException("پاسخ نامعتبر از مقصد")
+            val rb = ByteArray(rl)
+            inp.readFully(rb)
+            val ja = JSONObject(String(rb, Charsets.UTF_8)).getJSONArray("accept")
+            val accepted = (0 until ja.length()).map { ja.getInt(it) }
+                .filter { it in infos.indices }.distinct().sorted()
+            if (accepted.isEmpty()) throw IOException("دستگاه مقصد همه فایل‌ها را رد کرد")
             s.soTimeout = 30000
+            if (accepted.size < infos.size) log("مقصد ${accepted.size} فایل از ${infos.size} فایل را انتخاب کرد")
 
-            contentResolver.openInputStream(uri)!!.use { ins ->
-                val buf = ByteArray(CHUNK)
-                var sent = 0L
-                while (true) {
-                    val n = ins.read(buf)
-                    if (n < 0) break
-                    out.write(buf, 0, n)
-                    sent += n
-                    setProgress(sent, size)
+            val totalBytes = accepted.sumOf { infos[it].size }
+            var sentTotal = 0L
+            var count = 0
+            for (idx in accepted) {
+                val f = infos[idx]
+                count++
+                log("($count/${accepted.size}) در حال ارسال «${f.name}» ...")
+                contentResolver.openInputStream(sendUris[idx])!!.use { ins ->
+                    val buf = ByteArray(CHUNK)
+                    var sent = 0L
+                    while (sent < f.size) {
+                        val n = ins.read(buf, 0, minOf(buf.size.toLong(), f.size - sent).toInt())
+                        if (n < 0) throw IOException("فایل «${f.name}» زودتر از حد انتظار تمام شد")
+                        out.write(buf, 0, n)
+                        sent += n
+                        sentTotal += n
+                        setProgress(sentTotal, totalBytes)
+                    }
                 }
+                log("✓ «${f.name}» ارسال شد (${fmt(f.size)})")
             }
             out.flush()
             inp.readByte() // تایید نهایی
         }
-        log("✓ «$name» ارسال شد (${fmt(size)})")
+        log("✓ ارسال تمام شد")
     }
 
     override fun onDestroy() {
